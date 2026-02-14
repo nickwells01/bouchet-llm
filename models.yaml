@@ -1,0 +1,44 @@
+models:
+  Qwen/Qwen3-Coder-Next:
+    gpus: 2
+    max_len: 40960
+    quant: fp8
+    max_output_tokens: 4096
+    extra_vllm_args: "--enable-expert-parallel"
+    disable_thinking: true
+    description: "80B MoE (3B active), 256k ctx, 70% SWE-bench. Best coding agent."
+
+  Qwen/Qwen3-32B:
+    gpus: 1
+    max_len: 40960
+    quant: fp8
+    max_output_tokens: 4096
+    disable_thinking: true
+    description: "32B dense, 40k ctx. Fast general-purpose."
+
+  Qwen/Qwen2.5-72B-Instruct:
+    gpus: 1
+    max_len: 32768
+    quant: fp8
+    max_output_tokens: 4096
+    description: "72B dense, 32k ctx. Strong reasoning."
+
+  Qwen/Qwen2.5-1.5B-Instruct:
+    gpus: 1
+    max_len: 32768
+    quant: none
+    max_output_tokens: 4096
+    description: "1.5B dense. Quick testing only."
+
+  moonshotai/Kimi-Dev-72B:
+    gpus: 1
+    max_len: 40960
+    quant: fp8
+    max_output_tokens: 4096
+    description: "72B dense, 131k ctx, 60% SWE-bench. Strong coding agent."
+
+defaults:
+  gpus: 1
+  max_len: 32768
+  quant: fp8
+  max_output_tokens: 4096

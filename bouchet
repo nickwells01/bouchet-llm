@@ -1,0 +1,607 @@
+#!/bin/bash
+set -euo pipefail
+
+# ── bouchet — Claude Code backed by vLLM on Bouchet H200s ──────────
+#
+# Usage:
+#   bouchet                  Connect to running job + launch Claude Code
+#   bouchet --status         Show job info
+#   bouchet --launch [opts]  Submit new SLURM job, wait, tunnel, launch
+#   bouchet --chat           Simple chat mode (chat.py)
+#   bouchet --cancel         Cancel running job
+#   bouchet --tunnel         Open tunnel only (no Claude Code)
+#   bouchet --models         Show model catalog with download status
+#   bouchet --download <id>  Download a model to Bouchet
+#
+# Launch options (passed through to sbatch):
+#   --model <id>       Model name (default: Qwen/Qwen3-32B)
+#   --gpus <n>         Number of GPUs (default from catalog or 1)
+#   --time <HH:MM:SS>  Wall time (default: 06:00:00)
+#   --partition <name>  SLURM partition
+#   --quant <type>     Quantization: fp8, none (default from catalog)
+#   --max-len <n>      Max context length (default from catalog)
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || python3 -c "import os,sys; print(os.path.realpath(sys.argv[1]))" "$0")")" && pwd)"
+REMOTE="bouchet"
+REMOTE_BASE="~/project_pi_cc572/ngw23/project/llm-serve"
+CATALOG="${SCRIPT_DIR}/models.yaml"
+
+# ── Colors ──────────────────────────────────────────────────────────
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+BOLD='\033[1m'
+DIM='\033[2m'
+NC='\033[0m'
+
+# ── Helpers ─────────────────────────────────────────────────────────
+info()  { echo -e "${BLUE}▸${NC} $*"; }
+ok()    { echo -e "${GREEN}✓${NC} $*"; }
+warn()  { echo -e "${YELLOW}⚠${NC} $*"; }
+err()   { echo -e "${RED}✗${NC} $*" >&2; }
+
+get_latest_connection() {
+    ssh "$REMOTE" "ls -t ${REMOTE_BASE}/logs/connection-*.json 2>/dev/null | head -1" 2>/dev/null
+}
+
+read_connection() {
+    local conn_file="$1"
+    ssh "$REMOTE" "cat ${conn_file}" 2>/dev/null
+}
+
+get_running_job() {
+    ssh "$REMOTE" "squeue -u \$USER --name=vllm-serve -h -o '%i' 2>/dev/null | head -1" 2>/dev/null
+}
+
+tunnel_is_open() {
+    local port="$1"
+    pgrep -f "ssh.*-L.*${port}:.*${REMOTE}" > /dev/null 2>&1
+}
+
+check_server() {
+    local port="$1"
+    curl -sf "http://localhost:${port}/v1/models" > /dev/null 2>&1
+}
+
+open_tunnel() {
+    local node="$1" port="$2"
+    info "Opening SSH tunnel: localhost:${port} → ${node}:${port}"
+    ssh -f -N -L "${port}:${node}:${port}" "$REMOTE" 2>/dev/null
+    for i in $(seq 1 10); do
+        if check_server "$port"; then
+            ok "Tunnel established, server reachable"
+            return 0
+        fi
+        sleep 1
+    done
+    warn "Tunnel opened but server not yet reachable (may still be loading)"
+    return 0
+}
+
+# ── Catalog helpers ─────────────────────────────────────────────────
+catalog_lookup() {
+    # Usage: catalog_lookup <model_id> <field>
+    # Returns the field value or empty string if not found
+    python3 -c "
+import yaml, sys
+with open('${CATALOG}') as f:
+    cat = yaml.safe_load(f)
+model = cat.get('models', {}).get('$1', {})
+defaults = cat.get('defaults', {})
+val = model.get('$2', defaults.get('$2', ''))
+print(val)
+" 2>/dev/null
+}
+
+catalog_list_models() {
+    python3 -c "
+import yaml
+with open('${CATALOG}') as f:
+    cat = yaml.safe_load(f)
+for m in cat.get('models', {}):
+    print(m)
+" 2>/dev/null
+}
+
+print_status() {
+    local conn_json="$1"
+    local job_id model node port partition started
+    job_id=$(echo "$conn_json" | python3 -c "import sys,json; print(json.load(sys.stdin)['job_id'])")
+    model=$(echo "$conn_json" | python3 -c "import sys,json; print(json.load(sys.stdin)['model'])")
+    node=$(echo "$conn_json" | python3 -c "import sys,json; print(json.load(sys.stdin)['node'])")
+    port=$(echo "$conn_json" | python3 -c "import sys,json; print(json.load(sys.stdin)['port'])")
+    partition=$(echo "$conn_json" | python3 -c "import sys,json; print(json.load(sys.stdin).get('partition','?'))")
+    started=$(echo "$conn_json" | python3 -c "import sys,json; print(json.load(sys.stdin).get('started','?'))")
+
+    local state
+    state=$(ssh "$REMOTE" "squeue -j ${job_id} -h -o %T 2>/dev/null" 2>/dev/null || echo "GONE")
+
+    echo -e "${BOLD}═══════════════════════════════════════════════════════${NC}"
+    echo -e "${BOLD}  Bouchet LLM Status${NC}"
+    echo -e "${BOLD}═══════════════════════════════════════════════════════${NC}"
+    echo -e "  Job ID:     ${job_id}"
+    echo -e "  State:      ${state}"
+    echo -e "  Model:      ${model}"
+    echo -e "  Node:       ${node}:${port}"
+    echo -e "  Partition:  ${partition}"
+    echo -e "  Started:    ${started}"
+
+    if tunnel_is_open "$port"; then
+        echo -e "  Tunnel:     ${GREEN}open${NC} (localhost:${port})"
+        if check_server "$port"; then
+            echo -e "  Server:     ${GREEN}reachable${NC}"
+        else
+            echo -e "  Server:     ${YELLOW}not responding${NC}"
+        fi
+    else
+        echo -e "  Tunnel:     ${RED}closed${NC}"
+    fi
+    echo -e "${BOLD}═══════════════════════════════════════════════════════${NC}"
+}
+
+# ── Parse top-level action ──────────────────────────────────────────
+ACTION="connect"
+EXTRA_ARGS=()
+
+case "${1:-}" in
+    --status|-s)    ACTION="status"; shift ;;
+    --launch|-l)    ACTION="launch"; shift ;;
+    --chat|-c)      ACTION="chat"; shift ;;
+    --cancel)       ACTION="cancel"; shift ;;
+    --tunnel|-t)    ACTION="tunnel"; shift ;;
+    --models|-m)    ACTION="models"; shift ;;
+    --download|-d)  ACTION="download"; shift ;;
+    --help|-h)
+        echo "Usage: bouchet [action] [options]"
+        echo ""
+        echo "Actions:"
+        echo "  (none)           Connect to running job + launch Claude Code"
+        echo "  --status, -s     Show job info"
+        echo "  --launch, -l     Submit new SLURM job, wait, tunnel, launch Claude Code"
+        echo "  --chat, -c       Simple chat mode (chat.py)"
+        echo "  --cancel         Cancel running job"
+        echo "  --tunnel, -t     Open tunnel only (no Claude Code)"
+        echo "  --models, -m     Show model catalog with download status"
+        echo "  --download, -d   Download a model: bouchet --download Qwen/Qwen3-Coder-Next"
+        echo ""
+        echo "Launch options (with --launch):"
+        echo "  --model <id>       Model name (default: Qwen/Qwen3-32B)"
+        echo "  --gpus <n>         Number of GPUs (default from catalog)"
+        echo "  --time <HH:MM:SS>  Wall time (default: 06:00:00)"
+        echo "  --partition <name>  SLURM partition"
+        echo "  --quant <type>     Quantization: fp8, none (default from catalog)"
+        echo "  --max-len <n>      Max context length (default from catalog)"
+        exit 0
+        ;;
+    --*)  ;; # pass through to connect
+    *)    ;;
+esac
+
+# Collect remaining args
+EXTRA_ARGS=("$@")
+
+# ── Models: show catalog ─────────────────────────────────────────
+if [ "$ACTION" = "models" ]; then
+    info "Checking model downloads on Bouchet..."
+    # Get list of downloaded model dirs
+    DOWNLOADED=$(ssh "$REMOTE" "ls -d ~/project_pi_cc572/ngw23/hf_cache/hub/models--* 2>/dev/null | sed 's|.*/models--||; s|--|/|g'" 2>/dev/null || echo "")
+
+    echo ""
+    echo -e "${BOLD}═══════════════════════════════════════════════════════════════════════════════${NC}"
+    echo -e "${BOLD}  Model Catalog${NC}"
+    echo -e "${BOLD}═══════════════════════════════════════════════════════════════════════════════${NC}"
+    printf "  ${BOLD}%-35s %4s %7s %5s  %-8s  %s${NC}\n" "MODEL" "GPUs" "CTX" "QUANT" "STATUS" "DESCRIPTION"
+    echo -e "  ─────────────────────────────────────────────────────────────────────────────"
+
+    while IFS= read -r model_id; do
+        [ -z "$model_id" ] && continue
+        gpus=$(catalog_lookup "$model_id" "gpus")
+        max_len=$(catalog_lookup "$model_id" "max_len")
+        quant=$(catalog_lookup "$model_id" "quant")
+        desc=$(catalog_lookup "$model_id" "description")
+
+        # Check if downloaded (HF cache uses -- for / in model names)
+        hf_dir_name=$(echo "$model_id" | tr '/' '-')
+        if echo "$DOWNLOADED" | grep -qF "$model_id"; then
+            status="${GREEN}ready${NC}   "
+        else
+            status="${DIM}missing${NC} "
+        fi
+
+        # Shorten context for display
+        if [ "$max_len" -ge 1000 ]; then
+            ctx_display="$((max_len / 1024))k"
+        else
+            ctx_display="$max_len"
+        fi
+
+        printf "  %-35s %4s %7s %5s  ${status}  ${DIM}%s${NC}\n" "$model_id" "$gpus" "$ctx_display" "$quant" "$desc"
+    done < <(catalog_list_models)
+
+    echo -e "${BOLD}═══════════════════════════════════════════════════════════════════════════════${NC}"
+    echo ""
+    echo "  Launch:    bouchet --launch --model <model-id>"
+    echo "  Download:  bouchet --download <model-id>"
+    exit 0
+fi
+
+# ── Download: fetch model to Bouchet ─────────────────────────────
+if [ "$ACTION" = "download" ]; then
+    DL_MODEL="${EXTRA_ARGS[0]:-}"
+    if [ -z "$DL_MODEL" ]; then
+        err "Usage: bouchet --download <model-id>"
+        echo "  Example: bouchet --download Qwen/Qwen3-Coder-Next"
+        echo ""
+        echo "  Available models:"
+        while IFS= read -r m; do
+            echo "    $m"
+        done < <(catalog_list_models)
+        exit 1
+    fi
+
+    info "Downloading ${DL_MODEL} to Bouchet (this may take a while)..."
+    # Write a temp script to avoid quoting hell
+    ssh "$REMOTE" "cat > /tmp/bouchet_download.py << 'PYEOF'
+import os, sys
+os.environ['HF_HOME'] = os.path.expanduser('~/project_pi_cc572/ngw23/hf_cache')
+from huggingface_hub import snapshot_download
+model_id = sys.argv[1]
+print(f'Downloading {model_id}...')
+path = snapshot_download(model_id)
+print(f'Done: {path}')
+PYEOF"
+    ssh -t "$REMOTE" "~/.conda/envs/vllm_env/bin/python3 /tmp/bouchet_download.py '${DL_MODEL}'"
+    exit $?
+fi
+
+# ── Cancel ──────────────────────────────────────────────────────────
+if [ "$ACTION" = "cancel" ]; then
+    info "Cancelling vLLM jobs on Bouchet..."
+    ssh "$REMOTE" "scancel --name=vllm-serve 2>/dev/null; echo 'Done.'"
+    pkill -f "ssh.*-N.*-L.*${REMOTE}" 2>/dev/null && ok "Local tunnel closed" || true
+    exit 0
+fi
+
+# ── Launch: submit job, wait for it, then fall through to connect ───
+if [ "$ACTION" = "launch" ]; then
+    # Parse launch-specific args
+    L_MODEL="Qwen/Qwen3-32B"
+    L_GPUS=""
+    L_WALLTIME="06:00:00"
+    L_PARTITION=""
+    L_QUANT=""
+    L_MAX_LEN=""
+    L_MAX_OUTPUT_TOKENS=""
+    L_EXTRA_VLLM_ARGS=""
+
+    while [[ ${#EXTRA_ARGS[@]} -gt 0 ]]; do
+        case "${EXTRA_ARGS[0]}" in
+            --model)     L_MODEL="${EXTRA_ARGS[1]}"; EXTRA_ARGS=("${EXTRA_ARGS[@]:2}") ;;
+            --gpus)      L_GPUS="${EXTRA_ARGS[1]}"; EXTRA_ARGS=("${EXTRA_ARGS[@]:2}") ;;
+            --time)      L_WALLTIME="${EXTRA_ARGS[1]}"; EXTRA_ARGS=("${EXTRA_ARGS[@]:2}") ;;
+            --partition)  L_PARTITION="${EXTRA_ARGS[1]}"; EXTRA_ARGS=("${EXTRA_ARGS[@]:2}") ;;
+            --quant)     L_QUANT="${EXTRA_ARGS[1]}"; EXTRA_ARGS=("${EXTRA_ARGS[@]:2}") ;;
+            --max-len)   L_MAX_LEN="${EXTRA_ARGS[1]}"; EXTRA_ARGS=("${EXTRA_ARGS[@]:2}") ;;
+            *)           err "Unknown launch option: ${EXTRA_ARGS[0]}"; exit 1 ;;
+        esac
+    done
+
+    # Look up catalog defaults for this model (CLI flags override)
+    if [ -f "$CATALOG" ]; then
+        CAT_GPUS=$(catalog_lookup "$L_MODEL" "gpus")
+        CAT_MAX_LEN=$(catalog_lookup "$L_MODEL" "max_len")
+        CAT_QUANT=$(catalog_lookup "$L_MODEL" "quant")
+        CAT_MAX_OUTPUT=$(catalog_lookup "$L_MODEL" "max_output_tokens")
+        CAT_EXTRA_VLLM=$(catalog_lookup "$L_MODEL" "extra_vllm_args")
+        CAT_DISABLE_THINKING=$(catalog_lookup "$L_MODEL" "disable_thinking")
+
+        [ -z "$L_GPUS" ] && L_GPUS="${CAT_GPUS:-1}"
+        [ -z "$L_MAX_LEN" ] && L_MAX_LEN="${CAT_MAX_LEN:-32768}"
+        [ -z "$L_QUANT" ] && L_QUANT="${CAT_QUANT:-fp8}"
+        L_MAX_OUTPUT_TOKENS="${CAT_MAX_OUTPUT:-4096}"
+        L_EXTRA_VLLM_ARGS="${CAT_EXTRA_VLLM}"
+        L_DISABLE_THINKING="${CAT_DISABLE_THINKING:-false}"
+    else
+        [ -z "$L_GPUS" ] && L_GPUS=1
+        [ -z "$L_MAX_LEN" ] && L_MAX_LEN=32768
+        [ -z "$L_QUANT" ] && L_QUANT="fp8"
+        L_MAX_OUTPUT_TOKENS=4096
+    fi
+
+    # Auto-select partition
+    if [ -z "$L_PARTITION" ]; then
+        if [ "$L_GPUS" -le 2 ]; then
+            if [[ "$L_WALLTIME" == *-* ]]; then
+                L_DAYS="${L_WALLTIME%%-*}"; L_HMS="${L_WALLTIME#*-}"
+            else
+                L_DAYS=0; L_HMS="$L_WALLTIME"
+            fi
+            IFS=: read -r H M S <<< "$L_HMS"
+            TOTAL_SECS=$(( L_DAYS*86400 + 10#$H*3600 + 10#$M*60 + 10#$S ))
+            if [ "$TOTAL_SECS" -le 21600 ]; then
+                L_PARTITION="gpu_devel"
+            else
+                L_PARTITION="gpu_h200"
+            fi
+        else
+            L_PARTITION="gpu_h200"
+        fi
+    fi
+
+    # Compute resources
+    CPUS=$((L_GPUS * 4))
+    if [ "$L_PARTITION" = "gpu_devel" ] && [ "$CPUS" -gt 12 ]; then CPUS=12; fi
+    MEM=$((L_GPUS * 60))G
+    if [ "$L_PARTITION" != "gpu_devel" ]; then MEM=$((L_GPUS * 64))G; fi
+
+    info "Submitting vLLM job: model=${L_MODEL} gpus=${L_GPUS} quant=${L_QUANT} ctx=${L_MAX_LEN} partition=${L_PARTITION}"
+    if [ -n "$L_EXTRA_VLLM_ARGS" ]; then
+        info "Extra vLLM args: ${L_EXTRA_VLLM_ARGS}"
+    fi
+
+    EXPORT_VARS="MODEL=${L_MODEL},TP_SIZE=${L_GPUS},QUANTIZATION=${L_QUANT},MAX_MODEL_LEN=${L_MAX_LEN},DISABLE_THINKING=${L_DISABLE_THINKING}"
+    if [ -n "$L_EXTRA_VLLM_ARGS" ]; then
+        EXPORT_VARS="${EXPORT_VARS},EXTRA_VLLM_ARGS=${L_EXTRA_VLLM_ARGS}"
+    fi
+
+    SUBMIT_CMD="cd ${REMOTE_BASE} && sbatch \
+        --partition=${L_PARTITION} \
+        --time=${L_WALLTIME} \
+        --gres=gpu:h200:${L_GPUS} \
+        --cpus-per-task=${CPUS} \
+        --mem=${MEM} \
+        --export=ALL,${EXPORT_VARS} \
+        sbatch/vllm-serve.sbatch"
+
+    JOB_OUTPUT=$(ssh "$REMOTE" "$SUBMIT_CMD")
+    JOB_ID=$(echo "$JOB_OUTPUT" | grep -oE '[0-9]+$')
+
+    if [ -z "$JOB_ID" ]; then
+        err "Failed to submit job:"
+        echo "$JOB_OUTPUT"
+        exit 1
+    fi
+    ok "Job submitted: ${JOB_ID}"
+
+    # Wait for job to start
+    info "Waiting for job to start..."
+    for i in $(seq 1 120); do
+        STATE=$(ssh "$REMOTE" "squeue -j ${JOB_ID} -h -o %T 2>/dev/null || echo 'UNKNOWN'" 2>/dev/null)
+        if [ "$STATE" = "RUNNING" ]; then
+            ok "Job is RUNNING"
+            break
+        elif [ "$STATE" = "UNKNOWN" ] || [ -z "$STATE" ]; then
+            err "Job failed or was cancelled."
+            ssh "$REMOTE" "tail -20 ${REMOTE_BASE}/logs/vllm-${JOB_ID}.err 2>/dev/null" 2>/dev/null || true
+            exit 1
+        fi
+        echo -n "."
+        sleep 5
+    done
+    echo ""
+
+    # Wait for connection file
+    info "Waiting for connection info..."
+    CONN_FILE="${REMOTE_BASE}/logs/connection-${JOB_ID}.json"
+    for i in $(seq 1 30); do
+        CONN_JSON=$(read_connection "$CONN_FILE")
+        if [ -n "$CONN_JSON" ]; then
+            ok "Connection info ready"
+            break
+        fi
+        sleep 2
+    done
+
+    if [ -z "${CONN_JSON:-}" ]; then
+        err "Timed out waiting for connection file."
+        echo "  Check logs: ssh ${REMOTE} 'tail -50 ${REMOTE_BASE}/logs/vllm-${JOB_ID}.out'"
+        exit 1
+    fi
+
+    # Store values for LiteLLM config in connect section
+    export BOUCHET_MAX_OUTPUT_TOKENS="${L_MAX_OUTPUT_TOKENS}"
+    export BOUCHET_MAX_LEN="${L_MAX_LEN}"
+
+    # Fall through to connect logic below
+    EXTRA_ARGS=()
+    ACTION="connect"
+fi
+
+# ── For connect/status/chat/tunnel: find running job ────────────────
+# (skip if --launch already set CONN_JSON)
+if [ -z "${CONN_JSON:-}" ]; then
+    JOB_ID=$(get_running_job)
+
+    if [ -z "$JOB_ID" ]; then
+        err "No running vLLM job found on Bouchet."
+        echo ""
+        echo "  Start one with:  bouchet --launch"
+        echo "  Or:              bouchet --launch --model Qwen/Qwen3-Coder-Next"
+        exit 1
+    fi
+
+    # Find connection file for this job
+    CONN_FILE="${REMOTE_BASE}/logs/connection-${JOB_ID}.json"
+    CONN_JSON=$(read_connection "$CONN_FILE")
+
+    if [ -z "$CONN_JSON" ]; then
+        err "Job ${JOB_ID} is running but no connection file found."
+        echo "  The server may still be starting up. Try again in a minute."
+        exit 1
+    fi
+fi
+
+NODE=$(echo "$CONN_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['node'])")
+PORT=$(echo "$CONN_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['port'])")
+MODEL=$(echo "$CONN_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['model'])")
+JOB_ID=$(echo "$CONN_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['job_id'])")
+
+# ── Status ──────────────────────────────────────────────────────────
+if [ "$ACTION" = "status" ]; then
+    print_status "$CONN_JSON"
+    exit 0
+fi
+
+# ── Ensure tunnel is open ──────────────────────────────────────────
+if ! tunnel_is_open "$PORT"; then
+    open_tunnel "$NODE" "$PORT"
+elif check_server "$PORT"; then
+    ok "Tunnel already open, server reachable on localhost:${PORT}"
+else
+    warn "Tunnel open but server not responding — reopening..."
+    pkill -f "ssh.*-N.*-L.*${PORT}:.*${REMOTE}" 2>/dev/null || true
+    sleep 1
+    open_tunnel "$NODE" "$PORT"
+fi
+
+# ── Wait for server to be ready ────────────────────────────────────
+if ! check_server "$PORT"; then
+    info "Waiting for server to become ready (large models may take 3-5 min)..."
+    for i in $(seq 1 150); do
+        if check_server "$PORT"; then
+            ok "Server ready"
+            break
+        fi
+        echo -n "."
+        sleep 2
+    done
+    echo ""
+    if ! check_server "$PORT"; then
+        err "Server not responding after 5 minutes."
+        echo "  Check logs: ssh ${REMOTE} 'tail -50 ${REMOTE_BASE}/logs/vllm-${JOB_ID}.out'"
+        exit 1
+    fi
+fi
+
+# ── Tunnel-only mode ───────────────────────────────────────────────
+if [ "$ACTION" = "tunnel" ]; then
+    echo -e "${BOLD}═══════════════════════════════════════════════════════${NC}"
+    echo -e "  Tunnel open: ${GREEN}http://localhost:${PORT}/v1${NC}"
+    echo -e "  Model:       ${MODEL}"
+    echo -e "${BOLD}═══════════════════════════════════════════════════════${NC}"
+    echo ""
+    echo "  Test:  curl http://localhost:${PORT}/v1/models"
+    echo ""
+    echo "  For Claude Code:"
+    echo "    ANTHROPIC_BASE_URL=http://localhost:${PORT} ANTHROPIC_API_KEY=dummy claude"
+    exit 0
+fi
+
+# ── Chat mode ──────────────────────────────────────────────────────
+if [ "$ACTION" = "chat" ]; then
+    ok "Starting chat with ${MODEL} on localhost:${PORT}"
+    exec python3 "${SCRIPT_DIR}/chat.py" "$PORT"
+fi
+
+
+# -- Connect: start LiteLLM proxy + launch Claude Code -----------------
+
+LITELLM_PORT=4000
+CONFIG_TEMPLATE="${SCRIPT_DIR}/litellm_config.yaml"
+
+# Resolve max_len for input token computation
+RESOLVED_MAX_LEN="${BOUCHET_MAX_LEN:-}"
+if [ -z "$RESOLVED_MAX_LEN" ] && [ -f "$CATALOG" ]; then
+    RESOLVED_MAX_LEN=$(catalog_lookup "$MODEL" "max_len")
+fi
+RESOLVED_MAX_LEN="${RESOLVED_MAX_LEN:-32768}"
+
+# Resolve max_output_tokens: from launch env, or catalog lookup, or default
+MAX_OUTPUT_TOKENS="${BOUCHET_MAX_OUTPUT_TOKENS:-}"
+if [ -z "$MAX_OUTPUT_TOKENS" ] && [ -f "$CATALOG" ]; then
+    MAX_OUTPUT_TOKENS=$(catalog_lookup "$MODEL" "max_output_tokens")
+fi
+MAX_OUTPUT_TOKENS="${MAX_OUTPUT_TOKENS:-4096}"
+MAX_INPUT_TOKENS=$(( RESOLVED_MAX_LEN - MAX_OUTPUT_TOKENS ))
+
+# Kill any existing LiteLLM on the proxy port
+if lsof -ti:${LITELLM_PORT} >/dev/null 2>&1; then
+    warn "Port ${LITELLM_PORT} in use -- killing existing process"
+    kill $(lsof -ti:${LITELLM_PORT}) 2>/dev/null || true
+    sleep 1
+fi
+
+# Generate runtime config in SCRIPT_DIR (LiteLLM resolves callbacks relative to config)
+RUNTIME_CONFIG="${SCRIPT_DIR}/.litellm_runtime.yaml"
+VLLM_API_BASE="http://localhost:${PORT}/v1"
+sed -e "s|__VLLM_API_BASE__|${VLLM_API_BASE}|g" \
+    -e "s|__VLLM_MODEL__|${MODEL}|g" \
+    -e "s|__MAX_INPUT_TOKENS__|${MAX_INPUT_TOKENS}|g" \
+    -e "s|__MAX_OUTPUT_TOKENS__|${MAX_OUTPUT_TOKENS}|g" \
+    "$CONFIG_TEMPLATE" > "$RUNTIME_CONFIG"
+
+# Start LiteLLM proxy
+LITELLM_LOG=$(mktemp /tmp/bouchet-litellm-log.XXXXXXXX)
+LITELLM_PID=""
+
+cleanup() {
+    rm -f "$RUNTIME_CONFIG" "$LITELLM_LOG"
+    if [ -n "${LITELLM_PID:-}" ]; then
+        kill "$LITELLM_PID" 2>/dev/null || true
+        wait "$LITELLM_PID" 2>/dev/null || true
+    fi
+}
+trap cleanup EXIT INT TERM
+
+info "Starting LiteLLM proxy on :${LITELLM_PORT} (${MODEL} -> Claude API translation)"
+MAX_OUTPUT_TOKENS="${MAX_OUTPUT_TOKENS}" litellm --config "$RUNTIME_CONFIG" --port "$LITELLM_PORT" --num_workers 1 >"$LITELLM_LOG" 2>&1 &
+LITELLM_PID=$!
+
+# Wait for LiteLLM health
+PROXY_READY=false
+for i in $(seq 1 30); do
+    if ! kill -0 "$LITELLM_PID" 2>/dev/null; then
+        err "LiteLLM process died. Logs:"
+        cat "$LITELLM_LOG"
+        exit 1
+    fi
+    if curl -sf "http://localhost:${LITELLM_PORT}/health" >/dev/null 2>&1; then
+        PROXY_READY=true
+        break
+    fi
+    sleep 1
+done
+
+if [ "$PROXY_READY" = false ]; then
+    err "LiteLLM proxy did not start within 30s. Logs:"
+    tail -20 "$LITELLM_LOG"
+    exit 1
+fi
+ok "LiteLLM proxy running on :${LITELLM_PORT} (PID ${LITELLM_PID})"
+
+# -- Separate Claude config dir (avoids auth conflict with claude.ai) --
+BOUCHET_CONFIG_DIR="$HOME/.claude-bouchet"
+export CLAUDE_CONFIG_DIR="$BOUCHET_CONFIG_DIR"
+
+if [ ! -f "$BOUCHET_CONFIG_DIR/.claude.json" ]; then
+    mkdir -p "$BOUCHET_CONFIG_DIR"
+    cat > "$BOUCHET_CONFIG_DIR/.claude.json" <<'SEED'
+{
+  "hasCompletedOnboarding": true,
+  "primaryApiKey": "sk-unused",
+  "isQualifiedForDataSharing": false
+}
+SEED
+    [ -f "$HOME/.claude/settings.json" ] && cp "$HOME/.claude/settings.json" "$BOUCHET_CONFIG_DIR/settings.json"
+    [ -f "$HOME/.claude/settings.local.json" ] && cp "$HOME/.claude/settings.local.json" "$BOUCHET_CONFIG_DIR/settings.local.json"
+    ok "Created bouchet config at $BOUCHET_CONFIG_DIR"
+fi
+
+# -- Launch Claude Code -------------------------------------------------
+echo ""
+echo -e "${BOLD}=======================================================${NC}"
+echo -e "${BOLD}  Bouchet -> Claude Code${NC}"
+echo -e "${BOLD}=======================================================${NC}"
+echo -e "  Model:    ${MODEL}"
+echo -e "  Context:  ${RESOLVED_MAX_LEN} (input: ${MAX_INPUT_TOKENS}, output: ${MAX_OUTPUT_TOKENS})"
+echo -e "  vLLM:     ${GREEN}http://localhost:${PORT}${NC}"
+echo -e "  Proxy:    ${GREEN}http://localhost:${LITELLM_PORT}${NC} (LiteLLM)"
+echo -e "  Config:   ${BOUCHET_CONFIG_DIR}"
+echo -e "  Job ID:   ${JOB_ID} on ${NODE}"
+echo -e "${BOLD}=======================================================${NC}"
+echo ""
+
+export ANTHROPIC_BASE_URL="http://localhost:${LITELLM_PORT}"
+export ANTHROPIC_API_KEY="sk-unused"
+claude ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}

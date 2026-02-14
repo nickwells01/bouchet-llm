@@ -1,0 +1,38 @@
+# LiteLLM proxy config for bouchet
+# Placeholders substituted at runtime: __VLLM_API_BASE__, __VLLM_MODEL__, __MAX_INPUT_TOKENS__
+#
+# Maps all Claude model names Claude Code may request -> the actual vLLM model.
+
+model_list:
+  - model_name: claude-sonnet-4-5-20250929
+    litellm_params:
+      model: hosted_vllm/__VLLM_MODEL__
+      api_base: __VLLM_API_BASE__
+      max_tokens: __MAX_OUTPUT_TOKENS__
+    model_info:
+      max_input_tokens: __MAX_INPUT_TOKENS__
+      max_tokens: __MAX_OUTPUT_TOKENS__
+  - model_name: claude-opus-4-6
+    litellm_params:
+      model: hosted_vllm/__VLLM_MODEL__
+      api_base: __VLLM_API_BASE__
+      max_tokens: __MAX_OUTPUT_TOKENS__
+    model_info:
+      max_input_tokens: __MAX_INPUT_TOKENS__
+      max_tokens: __MAX_OUTPUT_TOKENS__
+  - model_name: claude-haiku-4-5-20251001
+    litellm_params:
+      model: hosted_vllm/__VLLM_MODEL__
+      api_base: __VLLM_API_BASE__
+      max_tokens: __MAX_OUTPUT_TOKENS__
+    model_info:
+      max_input_tokens: __MAX_INPUT_TOKENS__
+      max_tokens: __MAX_OUTPUT_TOKENS__
+
+general_settings:
+  enable_auth: false
+
+litellm_settings:
+  drop_params: true
+  modify_params: true
+  callbacks: litellm_clamp.max_tokens_clamper

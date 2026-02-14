@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+.litellm_runtime.yaml
+/tmp/
+*.log
